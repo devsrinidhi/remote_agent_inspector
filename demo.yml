@@ -1,0 +1,155 @@
+---
+##This playbook checks if agent is installed on remote hosts and saves the result to a local JSON file on ACS.
+##hosts data is stored in: ./hosts_data/'$HOSTNAME'_'$DATE'_data.json
+##Author: srinidhirao@
+##Date: 2020-Sept-03
+
+- name: Gather agent Configuration and store them on a local JSON file
+  hosts: all
+#  gather_facts: no
+  user: srinidhirao
+  become: true
+  vars: 
+    mydestfile : ./hosts_data/{{ ansible_hostname }}_{{ansible_date_time.date}}_data.json
+
+  tasks:
+
+### Collect info on all installed packages
+  - name: Gathering Package Facts
+    package_facts:
+      manager: auto
+
+### Collect info on all services (installed & running/stopped)
+  - name: Gathering Service Facts
+    service_facts:
+
+### First print host details
+  - name: Gathering host details and time of playbook run
+    copy:
+      content: "{\n\"Report_DateTime\": \"{{ ansible_date_time.iso8601 }}\",\n\n\"Target_Host\": \"{{ ansible_fqdn }}\",\n\"Host_IP\": \"{{ ansible_default_ipv4.address }}\",\n\"Host_OS\": \"{{ ansible_distribution }} {{ ansible_distribution_version }}\","
+      dest: "{{ mydestfile }}"
+    delegate_to: localhost
+    become_user: srinidhirao
+
+### Get client_name of the server
+  - name: Fetching client_name of the host by querying database
+    shell: mysql --user=srinidhirao --password=password --host=host1.domain.local --batch -s -N db1 --execute="SELECT client_name FROM db1.table WHERE host_name='{{ ansible_hostname }}';"
+    register: CNTL_name
+    ignore_errors: yes
+    delegate_to: localhost
+
+  - name: appending client_name info to the output file
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"Client_Name\": \"{{ CNTL_name.stdout }}\",\n"
+      insertafter: EOF
+    delegate_to: localhost
+    when: CNTL_name.stdout != ""
+
+  - name: appending 'NA' in the output file when client_name info is not found in database
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"Client_Name\": \"NA\",\n"
+      insertafter: EOF
+    delegate_to: localhost
+    when: CNTL_name.stdout == ""
+
+##### COLLECT ACCOUNT policy settings #####
+  - name: Gathering user account policy settings
+    shell: sed -e 's/^[ \t]*//' /etc/default/useradd | grep -v '^#' | grep -E -i -w '^INACTIVE'
+    changed_when: no
+    register: acctInactOutput
+    check_mode: no
+    failed_when: acctInactOutput.rc >=2
+    args:
+      warn: false
+
+  - name: appending - account locking after password expiry value - to output file (only if found)
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"InactivePaswdExpiry\": \"{{ acctInactOutput.stdout.split('=')[1] | trim }}\","
+      insertafter: EOF
+    delegate_to: localhost
+    when: acctInactOutput.rc == 0
+
+  - name: appending 'NA' in the output file when there is no entry in /etc/default/useradd
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"InactivePaswdExpiry\": \"NA\","
+      insertafter: EOF
+    delegate_to: localhost
+    when: not acctInactOutput.rc == 0
+
+#Disable Login after Unsuccessful Login Attempts - login.defs
+  - name: Gathering user account policy settings - Disable Login after Unsuccessful Login Attempts - login.defs
+    shell: sed -e 's/^[ \t]*//' /etc/login.defs | grep -v '^#' | grep -E -i -w '^LOGIN_RETRIES'
+    changed_when: no
+    register: loginretriesOutput1
+    check_mode: no
+    failed_when: loginretriesOutput1.rc >=2
+    args:
+      warn: false
+
+  - name: Gathering user account policy settings - Disable Login after Unsuccessful Login Attempts - login.defs trimmed output
+    shell: sed -e 's/^[ \t]*//' /etc/login.defs | grep -v '^#' | grep -E -i -w '^LOGIN_RETRIES' | sort -u | head -n1 | sed -e 's/[[:space:]]\+/ /g'
+    changed_when: no
+    register: loginretriesOutput2
+    check_mode: no
+    failed_when: loginretriesOutput2.rc >=2
+    args:
+      warn: false
+    when: loginretriesOutput1.rc == 0
+
+  - name: appending - Disable Login after Unsuccessful Login Attempts value - to output file (only if found)
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"LoginRetries_LoginDefs\": \"{{ loginretriesOutput2.stdout.split(' ')[1] | trim }}\","
+      insertafter: EOF
+    delegate_to: localhost
+    when: loginretriesOutput1.rc == 0
+
+  - name: appending 'NA' in the output file when there is no entry in /etc/login.defs
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\"LoginRetries_LoginDefs\": \"NA\","
+      insertafter: EOF
+    delegate_to: localhost
+    when: not loginretriesOutput1.rc == 0
+
+#check if SUID/SGID bit is set
+  - name: Gathering files and directories with SUID/SGID file permissions
+    shell: find / -mount -type f \( -perm -4000 -o -perm -2000 \)  -exec ls -ld {} \; | awk '{print "("$1")", $NF}'
+    changed_when: false
+    register: suidgidOutput
+
+  - name: appending list of files and directories with SUID/SGID file permissions to output file 
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\n\"SUID_SGID_files\": {{ suidgidOutput.stdout_lines | to_nice_json }}"
+      insertafter: EOF
+    delegate_to: localhost
+
+
+### Append ending }
+  - name: append ending } to output json file
+    lineinfile:
+      dest: "{{ mydestfile }}"
+      line: "\n}"
+      insertafter: EOF
+    delegate_to: localhost
+
+### Run the comparison code
+  - name: Comparing the collected configs against Standards and printing the compliance report
+    shell: python test.py {{ ansible_fqdn }}
+    register: CompareOutput
+    failed_when: CompareOutput.rc >=2
+    ignore_errors: yes
+    args:
+      warn: false
+    delegate_to: localhost
+
+### Change ownership of Output CSV files
+  - name: Change ownership of output CSV files
+    shell: chown -R srinidhirao:srinidhirao ./hosts_reports/*
+    ignore_errors: yes
+    delegate_to: localhost
